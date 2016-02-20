@@ -79,7 +79,7 @@
 			button_code1 = <0>;
 			button_code2 = <0>;
 			button_code3 = <0>;
-			touch_pressure_enabled = <1>;
+			touch_pressure_enabled = <0>;
 			touch_size_enabled = <0>;
 			touch_orientation_enabled = <0>;
 			enable_resume_por = <1>;

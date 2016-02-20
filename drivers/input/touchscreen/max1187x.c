@@ -566,7 +566,7 @@ err_send_mtp_command:
 }
 
 /* Integer math operations */
-u16 max1187x_sqrt(u32 num)
+static u16 max1187x_sqrt(u32 num)
 {
 	u16 mask = 0x8000;
 	u16 guess = 0;
@@ -576,11 +576,11 @@ u16 max1187x_sqrt(u32 num)
 		return num;
 
 	while (mask) {
-		guess = guess ^ mask;
+		guess ^= mask;
 		prod = guess * guess;
 		if (num < prod)
-			guess = guess ^ mask;
-		mask = mask>>1;
+			guess ^= mask;
+		mask >>= 1;
 	}
 	if (guess != 0xFFFF) {
 		prod = guess * guess;
@@ -672,18 +672,28 @@ static void report_down(struct data *ts,
 	}
 	valid = idev->users > 0;
 	ts->curr_finger_ids |= idbit;
-	z = (MXM_PRESSURE_SQRT_MAX >> 2) + max1187x_sqrt(z);
-	if (z > MXM_PRESSURE_SQRT_MAX)
-		z = MXM_PRESSURE_SQRT_MAX;
-	xsize = xpixel * (s16)xcell;
-	ysize = ypixel * (s16)ycell;
-	if (xsize < 0)
-		xsize = -xsize;
-	if (ysize < 0)
-		ysize = -ysize;
-	orientation = (xsize > ysize) ? 0 : 90;
-	touch_major = (xsize > ysize) ? xsize : ysize;
-	touch_minor = (xsize > ysize) ? ysize : xsize;
+
+	/*
+	 * Do not waste time calculating pressure, size and orientation
+	 * if not enabled.
+	 */
+	if (pdata->pressure_enabled) {
+		z = (MXM_PRESSURE_SQRT_MAX >> 2) + max1187x_sqrt(z);
+		if (z > MXM_PRESSURE_SQRT_MAX)
+			z = MXM_PRESSURE_SQRT_MAX;
+	}
+	if (pdata->size_enabled) {
+		xsize = xpixel * (s16)xcell;
+		ysize = ypixel * (s16)ycell;
+		if (xsize < 0)
+			xsize = -xsize;
+		if (ysize < 0)
+			ysize = -ysize;
+		touch_major = (xsize > ysize) ? xsize : ysize;
+		touch_minor = (xsize > ysize) ? ysize : xsize;
+	}
+	if (pdata->orientation_enabled)
+		orientation = (xsize > ysize) ? 0 : 90;
 
 	if (valid) {
 		input_mt_slot(idev, id);
