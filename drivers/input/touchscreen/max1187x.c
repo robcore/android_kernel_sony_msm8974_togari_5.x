@@ -254,10 +254,6 @@ struct data {
 	struct input_dev *input_dev;
 	struct input_dev *input_pen;
 	char phys[32];
-#ifdef MXM_TOUCH_WAKEUP_FEATURE
-	struct input_dev *input_dev_key;
-	char phys_key[32];
-#endif
 	bool is_suspended;
 	struct regulator *vreg_touch_vdd;
 	char *vdd_supply_name;
@@ -266,6 +262,7 @@ struct data {
 	u16 chip_id;
 	u16 config_id;
 
+	atomic_t irq_processing;
 	struct mutex fw_mutex;
 	struct mutex i2c_mutex;
 	struct mutex report_mutex;
@@ -298,6 +295,7 @@ struct data {
 	u8 sysfs_created;
 	bool is_raw_mode;
 	int screen_status;
+	u32 irq_receive_time;
 
 	u16 button0:1;
 	u16 button1:1;
@@ -778,26 +776,6 @@ static void invalidate_all_fingers(struct data *ts)
 	ts->used_tools = 0;
 }
 
-#ifdef MXM_TOUCH_WAKEUP_FEATURE
-static void report_wakeup_gesture(struct data *ts,
-				  struct max1187x_touch_report_header *header)
-{
-	struct device *dev = &ts->client->dev;
-	u16 code = header->touch_count | (header->reserved0 << 4);
-
-	dev_dbg(dev, "event: Received gesture: (0x%04X)\n", code);
-	if (code == MXM_PWR_DATA_WAKEUP_GEST) {
-		dev_dbg(dev, "event: Received touch wakeup report\n");
-		if (ts->input_dev_key->users) {
-			input_report_key(ts->input_dev_key, KEY_POWER, 1);
-			input_sync(ts->input_dev_key);
-			input_report_key(ts->input_dev_key, KEY_POWER, 0);
-			input_sync(ts->input_dev_key);
-		}
-	}
-}
-#endif
-
 static void process_report(struct data *ts, u16 *buf)
 {
 	u32 i;
@@ -811,12 +789,20 @@ static void process_report(struct data *ts, u16 *buf)
 		goto end;
 
 #ifdef MXM_TOUCH_WAKEUP_FEATURE
-	if (header->report_id == MXM_RPT_ID_POWER_MODE
-	    && device_may_wakeup(dev) && ts->is_suspended) {
-		report_wakeup_gesture(ts, header);
+	if (device_may_wakeup(&ts->client->dev) && ts->is_suspended) {
+		if (header->report_id == MXM_RPT_ID_POWER_MODE
+			&& buf[3] == MXM_PWR_DATA_WAKEUP_GEST) {
+			input_report_key(ts->input_dev,	KEY_POWER, 1);
+			input_sync(ts->input_dev);
+			input_report_key(ts->input_dev,	KEY_POWER, 0);
+			input_sync(ts->input_dev);
+		}
 		goto end;
 	}
 #endif
+	if (ts->is_suspended)
+		goto end;
+
 	if (header->report_id != MXM_RPT_ID_EXT_TOUCH_INFO)
 		goto end;
 
@@ -855,9 +841,22 @@ end:
 	return;
 }
 
+static u32 time_difference(u32 time_later, u32 time_earlier)
+{
+	u64 time_elapsed;
+
+	if (time_later >= time_earlier)
+		time_elapsed = time_later - time_earlier;
+	else
+		time_elapsed = time_later + 0x100000000 - time_earlier;
+
+	return (u32)time_elapsed;
+}
+
 static irqreturn_t irq_handler_soft(int irq, void *context)
 {
 	struct data *ts = (struct data *) context;
+	u32 time_elapsed;
 	int ret;
 
 	dev_dbg(&ts->client->dev, "%s: Enter\n", __func__);
@@ -865,7 +864,10 @@ static irqreturn_t irq_handler_soft(int irq, void *context)
 	mutex_lock(&ts->i2c_mutex);
 
 	ret = read_mtp_report(ts, ts->rx_packet);
-	if (!ret) {
+
+	time_elapsed = time_difference(jiffies, ts->irq_receive_time);
+
+	if (!ret && time_elapsed < CONFIG_HZ) {
 		process_report(ts, ts->rx_packet);
 		propagate_report(ts, 0, ts->rx_packet);
 	} else {
@@ -873,6 +875,8 @@ static irqreturn_t irq_handler_soft(int irq, void *context)
 	}
 
 	mutex_unlock(&ts->i2c_mutex);
+
+	atomic_set(&ts->irq_processing, 0);
 	dev_dbg(&ts->client->dev, "%s: Exit\n", __func__);
 	return IRQ_HANDLED;
 }
@@ -883,9 +887,15 @@ static irqreturn_t irq_handler_hard(int irq, void *context)
 
 	dev_dbg(&ts->client->dev, "%s: Enter\n", __func__);
 
+	if (atomic_read(&ts->irq_processing) == 1)
+		goto irq_handler_hard_complete;
+
 	if (gpio_get_value(ts->pdata->gpio_tirq))
 		goto irq_handler_hard_complete;
 
+	atomic_set(&ts->irq_processing, 1);
+
+	ts->irq_receive_time = jiffies;
 	ts->irq_count++;
 
 	dev_dbg(&ts->client->dev, "%s: Exit\n", __func__);
@@ -2078,6 +2088,7 @@ static int probe(struct i2c_client *client, const struct i2c_device_id *id)
 	ts->pdata = pdata;
 	ts->client = client;
 	i2c_set_clientdata(client, ts);
+	atomic_set(&ts->irq_processing, 0);
 	mutex_init(&ts->fw_mutex);
 	mutex_init(&ts->i2c_mutex);
 	mutex_init(&ts->report_mutex);
@@ -2214,27 +2225,7 @@ static int probe(struct i2c_client *client, const struct i2c_device_id *id)
 	dev_info(dev, "(INIT): Input touch pen device OK");
 
 #ifdef MXM_TOUCH_WAKEUP_FEATURE
-	ts->input_dev_key = input_allocate_device();
-	if (!ts->input_dev_key) {
-		dev_err(dev, "Failed to allocate touch input key device");
-		ret = -ENOMEM;
-		goto err_device_init_inputdevkey;
-	}
-	snprintf(ts->phys_key, sizeof(ts->phys_key), "%s/input1",
-		dev_name(&client->dev));
-	ts->input_dev_key->name = MAX1187X_KEY;
-	ts->input_dev_key->phys = ts->phys_key;
-	ts->input_dev_key->id.bustype = BUS_I2C;
-	__set_bit(EV_KEY, ts->input_dev_key->evbit);
-	set_bit(KEY_POWER, ts->input_dev_key->keybit);
-	ret = input_register_device(ts->input_dev_key);
-	if (ret) {
-		dev_err(dev, "Failed to register touch input key device");
-		ret = -EPERM;
-		input_free_device(ts->input_dev_key);
-		goto err_device_init_inputdevkey;
-	}
-	dev_info(dev, "(INIT): Input key device OK");
+	set_bit(KEY_POWER, ts->input_dev->keybit);
 #endif
 
 	/* Setup IRQ and handler */
@@ -2278,7 +2269,7 @@ static int probe(struct i2c_client *client, const struct i2c_device_id *id)
 #ifdef MXM_TOUCH_WAKEUP_FEATURE
 	dev_info(dev, "Touch Wakeup Feature enabled\n");
 	device_init_wakeup(&client->dev, 1);
-	device_wakeup_disable(&client->dev);
+	device_set_wakeup_enable(&client->dev, true);
 #endif
 
 	dev_info(dev, "(INIT): Done\n");
@@ -2287,10 +2278,6 @@ static int probe(struct i2c_client *client, const struct i2c_device_id *id)
 err_device_init_sysfs_remove_group:
 	remove_sysfs_entries(ts);
 err_device_init_irq:
-#ifdef MXM_TOUCH_WAKEUP_FEATURE
-	input_unregister_device(ts->input_dev_key);
-err_device_init_inputdevkey:
-#endif
 	input_unregister_device(ts->input_pen);
 err_device_init_inputpendev:
 	input_unregister_device(ts->input_dev);
@@ -2330,9 +2317,6 @@ static int remove(struct i2c_client *client)
 	if (client->irq)
 			free_irq(client->irq, ts);
 
-#ifdef MXM_TOUCH_WAKEUP_FEATURE
-	input_unregister_device(ts->input_dev_key);
-#endif
 	sysfs_remove_link(ts->input_dev->dev.kobj.parent,
 						MAX1187X_NAME);
 	input_unregister_device(ts->input_dev);
