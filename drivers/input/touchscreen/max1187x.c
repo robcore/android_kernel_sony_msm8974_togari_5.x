@@ -1061,14 +1061,28 @@ static ssize_t dflt_cfg_show(struct device *dev, struct device_attribute *attr,
 			ts->pdata->default_chip_id);
 }
 
+#define SSCANF_VERIFY_OK(ret, num_attrs, err_msg)		\
+({								\
+	int err = 1;						\
+	if (ret != num_attrs) {					\
+		dev_err(dev, "%s: " err_msg "\n", __func__);	\
+		err = 0;					\
+	}							\
+	err;							\
+})
+
 static ssize_t dflt_cfg_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	struct data *ts = i2c_get_clientdata(client);
+	int ret;
 
-	(void) sscanf(buf, "%u 0x%x 0x%x", &ts->pdata->defaults_allow,
+	ret = sscanf(buf, "%u 0x%x 0x%x", &ts->pdata->defaults_allow,
 		&ts->pdata->default_config_id, &ts->pdata->default_chip_id);
+	if (!SSCANF_VERIFY_OK(ret, 3, "Failed to store cfg"))
+		return -EINVAL;
+
 	return count;
 }
 
@@ -1089,11 +1103,15 @@ static ssize_t panel_store(struct device *dev, struct device_attribute *attr,
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	struct data *ts = i2c_get_clientdata(client);
+	int ret;
 
-	(void) sscanf(buf, "%u %u %u %u %u %u", &ts->pdata->panel_margin_xl,
+	ret = sscanf(buf, "%u %u %u %u %u %u", &ts->pdata->panel_margin_xl,
 		&ts->pdata->panel_margin_xh, &ts->pdata->panel_margin_yl,
 		&ts->pdata->panel_margin_yh, &ts->pdata->lcd_x,
 		&ts->pdata->lcd_y);
+	if (!SSCANF_VERIFY_OK(ret, 6, "Failed to store panel attrs"))
+		return -EINVAL;
+
 	return count;
 }
 
@@ -1187,10 +1205,9 @@ static ssize_t command_store(struct device *dev, struct device_attribute *attr,
 	scan_buf[4] = '\0';
 	for (i = 0; i < count; i += 4) {
 		memcpy(scan_buf, &buf[i], 4);
-		if (sscanf(scan_buf, "%4hx", &buffer[i / 4]) != 1) {
-			dev_err(dev, "bad word (%s)", scan_buf);
+		ret = sscanf(scan_buf, "%4hx", &buffer[i / 4]);
+		if (!SSCANF_VERIFY_OK(ret, 1, "bad word"))
 			return -EINVAL;
-		}
 	}
 	ret = cmd_send(ts, buffer, count / 4);
 	if (ret)
@@ -1214,11 +1231,11 @@ static ssize_t screen_status_store(struct device *dev,
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	struct data *ts = i2c_get_clientdata(client);
+	int ret;
 
-	if (sscanf(buf, "%d", &ts->screen_status) != 1) {
-		dev_err(dev, "bad value (%s)", buf);
+	ret = sscanf(buf, "%d", &ts->screen_status);
+	if (!SSCANF_VERIFY_OK(ret, 1, "bad value"))
 		return -EINVAL;
-	}
 	dev_dbg(&ts->client->dev, "%s: screen_status = %d\n", __func__,
 				ts->screen_status);
 
